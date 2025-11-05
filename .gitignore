@@ -1,0 +1,14 @@
+# Vim swap files
+*.swp
+*.swo
+
+# Built containers
+*.sif
+
+# Log files
+*.log
+
+# Logs directory
+logs/
+./logs/
+

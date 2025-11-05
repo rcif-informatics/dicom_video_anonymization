@@ -1,9 +1,10 @@
+
 Bootstrap: docker
 From: ubuntu:22.04
 
 %labels
     Maintainer "hodgem@wustl.edu"
-    Purpose    "DICOM raw RGB → masked video/DICOM pipeline"
+    Purpose    "DICOM anonymization (mask) + lossless video + optional lossless re-compress via GDCM"
 
 %help
 Usage:
@@ -13,9 +14,9 @@ Usage:
 %environment
     export LC_ALL=C.UTF-8
     export LANG=C.UTF-8
-    export PATH=/opt/app:$PATH
+    # Make venv Python default for the runtime:
+    export PATH=/opt/venv/bin:/opt/app:$PATH
 
-# >>> Copy files from host into the image (relative to the .def file) <<<
 %files
     bin/dicom_video_anonymization.sh /opt/app/dicom_video_anonymization
 
@@ -23,23 +24,41 @@ Usage:
     set -eux
     export DEBIAN_FRONTEND=noninteractive
 
+    # Enable Universe (needed on Jammy)
     apt-get update
+    apt-get install -y --no-install-recommends software-properties-common ca-certificates
+    add-apt-repository -y universe
+    apt-get update
+
+    # OS packages
     apt-get install -y --no-install-recommends \
         bash coreutils findutils grep sed gawk procps file jq \
-        python3 python3-pip ffmpeg dcmtk
+        python3 python3-venv python3-pip python3-dev \
+        ffmpeg dcmtk \
+        libgdcm3.0 libcharls2 libopenjp2-7 libjpeg-turbo8 \
+        libgdcm-tools
+
+    # Create venv and install Python deps there
+    python3 -m venv /opt/venv
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+    /opt/venv/bin/pip install --no-cache-dir \
+        numpy pydicom "pylibjpeg[all]"
+
+    # Tools should be on PATH at build-time too:
+    export PATH=/opt/venv/bin:/opt/app:$PATH
+
+    chmod 0755 /opt/app/dicom_video_anonymization
     apt-get clean
     rm -rf /var/lib/apt/lists/*
-
-    pip3 install --no-cache-dir pydicom numpy pylibjpeg[all]
-
-    chmod 755 /opt/app/dicom_video_anonymization
 
 %test
     set -eux
     test -x /opt/app/dicom_video_anonymization
     dcmdump --version | head -n1
+    gdcmconv --version | head -n1
     ffmpeg -version | head -n1
-    python3 -c 'import pydicom,sys; print("pydicom", pydicom.__version__)'
+    # Verify we are using venv python and have numpy/pydicom/pylibjpeg
+    python -c "import sys, numpy, pydicom, pylibjpeg; print(sys.executable); print('numpy', numpy.__version__); print('pydicom', pydicom.__version__); print('pylibjpeg', pylibjpeg.__version__)"
 
 %runscript
     cd /work 2>/dev/null || true
