@@ -17,6 +17,7 @@ OUTPUT_DIR=""
 NUM_THREADS=4
 OVERWRITE=0
 KEEP_RAW="${KEEP_RAW:-0}"   # set to 1 to keep *.raw intermediates
+NO_MKV="${NO_MKV:-0}"       # set via -V/--no-mkv to skip .mkv output
 # Blur single-frame PNGs if there are at least this many black rows from the top
 # These have been shown to contain PHI outside of the standard area we are checking.
 BLUR_TOP_BLACK_ROWS="${BLUR_TOP_BLACK_ROWS:-5}"
@@ -45,7 +46,8 @@ export BLUR_TOP_BLACK_ROWS VID_CODEC KEEP_RAW OVERWRITE ULTRASOUND_FALLBACK_FRAC
 
 usage() {
   cat <<USAGE
-Usage: $0 -i <input_dir> -o <output_dir> [-n <num_threads>] [--overwrite-existing]
+Usage: $0 -i <input_dir> -o <output_dir> [-n <num_threads>] [--overwrite-existing] [--no-mkv|-V]
+
 
 Notes:
   * Expects input files under: <input_dir>/<session_date>/<session_id>/.../*.dcm
@@ -55,6 +57,7 @@ Notes:
       <output_dir>/<session_date>/<session_id>/ANON_IMG/*.png
       <output_dir>/<session_date>/<session_id>/ANON_QC/*.png
   * Only uncompressed transfer syntaxes are edited losslessly. Compressed are skipped.
+  * Use --no-mkv / -V to skip ANON_VID .mkv creation (DICOM + QC PNG still produced).
 USAGE
   exit 1
 }
@@ -241,8 +244,13 @@ PY
   local out_qc_dir="$out_base/ANON_QC"
   local out_vid_dir="$out_base/ANON_VID"
   local out_img_dir="$out_base/ANON_IMG"
-  mkdir -p "$out_dcm_dir" "$out_qc_dir" "$out_vid_dir" "$out_img_dir"
+  # Always need DICOM, QC, and IMG dirs
+  mkdir -p "$out_dcm_dir" "$out_qc_dir" "$out_img_dir"
 
+  # Only create ANON_VID if we’re actually keeping video
+  if [[ "${NO_MKV:-0}" -eq 0 ]]; then
+    mkdir -p "$out_vid_dir"
+  fi
 
   # Pull minimal metadata via dcmdump (fast & robust)
   tag() {
@@ -455,9 +463,18 @@ PY
         return 0
       fi
     else
-      if [[ -s "$out_dcm" && -s "$out_vid" && -s "$out_png" ]]; then
-        echo "  ⏭  Skip (exists: DCM & MKV & PNG)"
-        return 0
+      if [[ "$NO_MKV" -eq 1 ]]; then
+        # When MKV is disabled, only require DCM + QC PNG
+        if [[ -s "$out_dcm" && -s "$out_png" ]]; then
+          echo "  ⏭  Skip (exists: DCM & QC PNG; MKV disabled)"
+          return 0
+        fi
+      else
+        # Default behavior: require DCM + MKV + QC PNG
+        if [[ -s "$out_dcm" && -s "$out_vid" && -s "$out_png" ]]; then
+          echo "  ⏭  Skip (exists: DCM & MKV & PNG)"
+          return 0
+        fi
       fi
     fi
   fi
@@ -482,7 +499,8 @@ PY
   echo "  FPS=$fps (from FrameTime=${ft_ms:-N/A})"
 
   # Path for rgb24 raw stream (all frames)
-  raw_rgb="$out_vid.rgb24.raw"
+  # Keep it alongside QC artifacts so it exists even when MKV is disabled.
+  raw_rgb="$out_qc_dir/${base}_anon.rgb24.raw"
   raw_gray16="$out_img.gray16le.raw"
 
   cleanup_raws() {
@@ -1214,46 +1232,65 @@ PY
     echo "     - $out_dcm"
     [[ -s "$out_img" ]] && echo "     - $out_img"
   else
-    # Multi-frame → MKV + QC as before
+    # Multi-frame → MKV + QC (unless --no-mkv)
     out_vid="$out_vid_dir/${base}_anon.mkv"
+
     if [[ -s "$raw_rgb" ]]; then
-      echo "  ffmpeg: making lossless video (${cols}x${rows} @ ${fps}fps) -> $VID_CODEC"
-      if [[ "$VID_CODEC" == "ffv1" ]]; then
-        ffmpeg -hide_banner -loglevel error -nostdin -y \
-          -f rawvideo -pixel_format rgb24 -video_size "${cols}x${rows}" -r "$fps" \
-          -i "$raw_rgb" \
-          -c:v ffv1 -level 3 -g 1 -coder 1 -context 1 -slices 24 -slicecrc 1 \
-          -pix_fmt rgb24 \
-          "$out_vid"
+      if [[ "$NO_MKV" -eq 0 ]]; then
+        echo "  ffmpeg: making lossless video (${cols}x${rows} @ ${fps}fps) -> $VID_CODEC"
+        if [[ "$VID_CODEC" == "ffv1" ]]; then
+          ffmpeg -hide_banner -loglevel error -nostdin -y \
+            -f rawvideo -pixel_format rgb24 -video_size "${cols}x${rows}" -r "$fps" \
+            -i "$raw_rgb" \
+            -c:v ffv1 -level 3 -g 1 -coder 1 -context 1 -slices 24 -slicecrc 1 \
+            -pix_fmt rgb24 \
+            "$out_vid"
+        else
+          ffmpeg -hide_banner -loglevel error -nostdin -y \
+            -f rawvideo -pixel_format rgb24 -video_size "${cols}x${rows}" -r "$fps" \
+            -i "$raw_rgb" \
+            -c:v libx264rgb -crf 0 -preset veryslow -pix_fmt rgb24 \
+            "$out_vid"
+        fi
       else
-        ffmpeg -hide_banner -loglevel error -nostdin -y \
-          -f rawvideo -pixel_format rgb24 -video_size "${cols}x${rows}" -r "$fps" \
-          -i "$raw_rgb" \
-          -c:v libx264rgb -crf 0 -preset veryslow -pix_fmt rgb24 \
-          "$out_vid"
+        echo "  ⏭  MKV generation disabled (--no-mkv); skipping .mkv output"
       fi
     else
       echo "  ⚠️  No rgb24 raw produced; skipping video"
     fi
-    
-    # Middle frame for QC (only if we actually created the video)
-    if [[ -s "$out_vid" ]]; then
-      local mid=0
-      if [[ -n "$frames" && "$frames" =~ ^[0-9]+$ && "$frames" -gt 0 ]]; then
-        mid=$(( (frames - 1) / 2 ))
+
+    # Middle frame for QC PNG
+    local mid=0
+    if [[ -n "$frames" && "$frames" =~ ^[0-9]+$ && "$frames" -gt 0 ]]; then
+      mid=$(( (frames - 1) / 2 ))
+    fi
+
+    if [[ -s "$raw_rgb" ]]; then
+      if [[ "$NO_MKV" -eq 0 ]]; then
+        if [[ -s "$out_vid" ]]; then
+          ffmpeg -hide_banner -loglevel error -nostdin -y \
+            -i "$out_vid" \
+            -vf "select=eq(n\,${mid})" -frames:v 1 "$out_png"
+        else
+          echo "  ⚠️  No video; skipping QC PNG"
+        fi
+      else
+        echo "  ffmpeg: making QC PNG from rgb24 raw (no MKV) (${cols}x${rows} @ frame ${mid})"
+        ffmpeg -hide_banner -loglevel error -nostdin -y \
+          -f rawvideo -pixel_format rgb24 -video_size "${cols}x${rows}" -r "$fps" \
+          -i "$raw_rgb" \
+          -vf "select=eq(n\,${mid})" -frames:v 1 "$out_png"
       fi
-      ffmpeg -hide_banner -loglevel error -nostdin -y \
-        -i "$out_vid" \
-        -vf "select=eq(n\,${mid})" -frames:v 1 "$out_png"
     else
-      echo "  ⚠️  No video; skipping QC PNG"
+      echo "  ⚠️  No rgb24 raw; skipping QC PNG"
     fi
 
     echo "  ✅ Wrote:"
     echo "     - $out_dcm"
-    [[ -s "$out_vid" ]] && echo "     - $out_vid"
+    if [[ "$NO_MKV" -eq 0 && -s "$out_vid" ]]; then
+      echo "     - $out_vid"
+    fi
     [[ -s "$out_png" ]] && echo "     - $out_png"
-
   fi
 
 }
@@ -1272,6 +1309,7 @@ while [[ $# -gt 0 ]]; do
     -o|--output-dir) OUTPUT_DIR="$2"; shift 2;;
     -n|--num-threads) NUM_THREADS="$2"; shift 2;;
     --overwrite-existing|-O) OVERWRITE=1; shift 1;;
+    --no-mkv|-V) NO_MKV=1; shift 1;;
     -h|--help) usage;;
     *) echo "Unknown argument: $1" >&2; usage;;
   esac
@@ -1289,6 +1327,7 @@ SCRIPT_PATH="$(readlink -f "$0")"
 
 # ---------- Parallel dispatcher (streaming; no SIGPIPE aborts) ----------
 export PYTHONUNBUFFERED=1
+export NO_MKV
 export -f process_one detect_black_rows_rgb24_from_dicom detect_top_black_rows_rgb24_from_dicom detect_near_black_pct_from_dicom
 
 # Save & disable pipefail only for this pipeline

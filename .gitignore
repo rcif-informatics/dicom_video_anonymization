@@ -1,9 +1,14 @@
 # Vim swap files
 *.swp
 *.swo
+.sw*
 
 # Built containers
 *.sif
+
+# Local backup files
+*.bk*
+*.bak*
 
 # Log files
 *.log
